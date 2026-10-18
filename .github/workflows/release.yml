@@ -6,6 +6,29 @@ name: Release
 on:
   push:
     tags: ["v[0-9]*"]
+  # Manual, fork-friendly release. Builds the universal (Intel + Apple Silicon)
+  # app and publishes a DMG without Apple signing or notarization. The hardened
+  # jobs below only run on a tag push in the upstream repo, so they stay inert
+  # for a manual run — this trigger drives the custom-release job instead.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v3.4.1-intel)"
+        required: true
+        type: string
+      title:
+        description: "Release title (defaults to the tag)"
+        required: false
+        type: string
+      notes:
+        description: "Release notes (optional; a default note is used if blank)"
+        required: false
+        type: string
+      prerelease:
+        description: "Mark as a pre-release"
+        required: false
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -394,3 +417,89 @@ jobs:
             exit 1
           fi
           verify_release false
+
+  custom-release:
+    name: Custom universal release (fork, unsigned)
+    # Manual runs only. The hardened jobs above are gated to tag pushes in
+    # vorssaint/vorssaint-utils, so none of them run on this trigger; this job
+    # builds the universal app and publishes an unsigned DMG for the fork.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: write # Creates the tag and release; no Apple credentials are used.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build universal app (arm64 + x86_64)
+        run: ./build.sh
+
+      - name: Verify the binary is universal
+        run: |
+          set -euo pipefail
+          APP="build/stage/Vorssaint.app/Contents/MacOS/Vorssaint"
+          ARCHS="$(lipo -archs "$APP")"
+          echo "architectures: $ARCHS"
+          for want in arm64 x86_64; do
+            case " $ARCHS " in
+              *" $want "*) ;;
+              *) echo "missing $want slice in $APP" >&2; exit 1 ;;
+            esac
+          done
+
+      - name: Package DMG
+        run: ./Tools/make-dmg.sh
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Inputs flow through env, never interpolated into the script body.
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+          NOTES: ${{ inputs.notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          DMG="$(ls dist/*.dmg | head -1)"
+          if [[ ! -f "$DMG" ]]; then
+            echo "No DMG was produced in dist/" >&2
+            exit 1
+          fi
+
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          if [[ -n "${NOTES:-}" ]]; then
+            printf '%s\n' "$NOTES" > "$NOTES_FILE"
+          else
+            {
+              echo "Universal (Intel + Apple Silicon) build of Vorssaint."
+              echo ""
+              echo "This build is **not** signed with an Apple Developer ID or notarized. On first launch, right-click the app and choose Open, or allow it under System Settings → Privacy & Security. Requires macOS 14 or later."
+            } > "$NOTES_FILE"
+          fi
+
+          TITLE="${TITLE:-$TAG}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" --clobber
+            EDIT_ARGS=("$TAG" --title "$TITLE" --notes-file "$NOTES_FILE")
+            if [[ "$PRERELEASE" == "true" ]]; then
+              EDIT_ARGS+=(--prerelease)
+            else
+              EDIT_ARGS+=(--prerelease=false)
+            fi
+            gh release edit "${EDIT_ARGS[@]}"
+          else
+            CREATE_ARGS=(
+              "$TAG" "$DMG"
+              --target "$GITHUB_SHA"
+              --title "$TITLE"
+              --notes-file "$NOTES_FILE"
+            )
+            if [[ "$PRERELEASE" == "true" ]]; then
+              CREATE_ARGS+=(--prerelease)
+            fi
+            gh release create "${CREATE_ARGS[@]}"
+          fi
+          echo "Published $TAG with asset $(basename "$DMG")"
