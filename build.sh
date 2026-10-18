@@ -62,7 +62,32 @@ FAN_HELPER_ID="$APP_BUNDLE_ID.fan-control"
 # Sources/NowPlayingAdapter. Staged under Contents/Frameworks, signed on its own.
 NOW_PLAYING_ADAPTER_ID="$APP_BUNDLE_ID.now-playing"
 NOW_PLAYING_ADAPTER="libVorssaintNowPlaying.dylib"
-TARGET="arm64-apple-macosx14.0"
+# Shipped binaries are built for each of these architectures and lipo'd into a
+# single universal Mach-O, so the app runs natively on both Apple Silicon and
+# Intel. Upstream builds arm64 only, which is why its binaries do not run on
+# Intel Macs. Override with VORSSAINT_ARCHS to build a single arch, e.g.
+# `VORSSAINT_ARCHS=x86_64` (Intel only) or `VORSSAINT_ARCHS=arm64`.
+TARGET_SUFFIX="-apple-macosx14.0"
+if [[ -n "${VORSSAINT_ARCHS:-}" ]]; then
+    ARCHS=(${=VORSSAINT_ARCHS})
+else
+    ARCHS=(arm64 x86_64)
+fi
+# The test binary compiles and runs on this machine, so it is built for the host
+# architecture only (a non-host slice could not execute here).
+TARGET="$(uname -m)$TARGET_SUFFIX"
+
+# Combine per-architecture Mach-O files into one artifact: lipo when there are
+# several, a plain copy when only one architecture was requested.
+lipo_combine() {
+    local output="$1"
+    shift
+    if (( $# == 1 )); then
+        cp "$1" "$output"
+    else
+        lipo -create "$@" -output "$output"
+    fi
+}
 ENTITLEMENTS="Resources/Vorssaint.entitlements"
 LEGACY_IDENTITY="Vorssaint Utils Signing"
 
@@ -579,38 +604,60 @@ if (( ! DEV )); then
 fi
 APP_OBJECT_DIR="build/objects/$EXECUTABLE"
 mkdir -p build "$APP_OBJECT_DIR"
-APP_OUTPUT_FILE_MAP="$APP_OBJECT_DIR/output-file-map.json"
-write_swift_output_file_map "$APP_OUTPUT_FILE_MAP" "$APP_OBJECT_DIR" "${APP_SOURCES[@]}"
 # Without -j the driver compiles one file at a time, and without batch mode
 # each file's compiler parses the whole module again: a clean release took a
 # quarter of an hour. Batches share that work and run on every core, and the
-# optimization stays per file, as before.
-swiftc "${APP_OPTIMIZATION_FLAGS[@]}" -incremental -enable-batch-mode -j "$(sysctl -n hw.logicalcpu)" \
-    -output-file-map "$APP_OUTPUT_FILE_MAP" \
-    -target "$TARGET" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" "${VM_STATISTICS_COMPAT_FLAGS[@]}" "${HID_EVENT_SYSTEM_FLAGS[@]}" \
-    "${BUILD_VARIANT_FLAGS[@]}" \
-    "${APP_SOURCES[@]}" -o "build/$EXECUTABLE"
+# optimization stays per file, as before. Each architecture keeps its own
+# object dir and incremental records, then the slices are lipo'd together.
+APP_ARCH_BINARIES=()
+for arch in "$ARCHS[@]"; do
+    arch_object_dir="$APP_OBJECT_DIR/$arch"
+    mkdir -p "$arch_object_dir"
+    arch_output_file_map="$arch_object_dir/output-file-map.json"
+    write_swift_output_file_map "$arch_output_file_map" "$arch_object_dir" "${APP_SOURCES[@]}"
+    (( ${#ARCHS} > 1 )) && echo "  → $arch"
+    swiftc "${APP_OPTIMIZATION_FLAGS[@]}" -incremental -enable-batch-mode -j "$(sysctl -n hw.logicalcpu)" \
+        -output-file-map "$arch_output_file_map" \
+        -target "$arch$TARGET_SUFFIX" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" "${VM_STATISTICS_COMPAT_FLAGS[@]}" "${HID_EVENT_SYSTEM_FLAGS[@]}" \
+        "${BUILD_VARIANT_FLAGS[@]}" \
+        "${APP_SOURCES[@]}" -o "build/$EXECUTABLE.$arch"
+    APP_ARCH_BINARIES+=("build/$EXECUTABLE.$arch")
+done
+lipo_combine "build/$EXECUTABLE" "${APP_ARCH_BINARIES[@]}"
 
 echo "▸ Compiling protected fan helper…"
-swiftc -O -target "$TARGET" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" "${BUILD_VARIANT_FLAGS[@]}" \
-    Sources/Vorssaint/Services/FanControl/FanControlSupport.swift \
-    Sources/Vorssaint/Services/FanControl/FanControlXPC.swift \
-    Sources/Vorssaint/Services/SystemMonitor/SMCClient.swift \
-    Sources/Vorssaint/Services/Metrics/TemperatureSensorSelector.swift \
-    Sources/Vorssaint/Services/FanControl/FanControlHardware.swift \
-    Sources/FanControlHelper/main.swift \
-    -o "build/$FAN_HELPER_ID"
+FAN_HELPER_ARCH_BINARIES=()
+for arch in "$ARCHS[@]"; do
+    (( ${#ARCHS} > 1 )) && echo "  → $arch"
+    swiftc -O -target "$arch$TARGET_SUFFIX" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" "${BUILD_VARIANT_FLAGS[@]}" \
+        Sources/Vorssaint/Services/FanControl/FanControlSupport.swift \
+        Sources/Vorssaint/Services/FanControl/FanControlXPC.swift \
+        Sources/Vorssaint/Services/SystemMonitor/SMCClient.swift \
+        Sources/Vorssaint/Services/Metrics/TemperatureSensorSelector.swift \
+        Sources/Vorssaint/Services/FanControl/FanControlHardware.swift \
+        Sources/FanControlHelper/main.swift \
+        -o "build/$FAN_HELPER_ID.$arch"
+    FAN_HELPER_ARCH_BINARIES+=("build/$FAN_HELPER_ID.$arch")
+done
+lipo_combine "build/$FAN_HELPER_ID" "${FAN_HELPER_ARCH_BINARIES[@]}"
+# The universal (or single-arch) helper runs the host slice here.
 "build/$FAN_HELPER_ID" --selftest
 
 echo "▸ Compiling Now Playing adapter…"
-swiftc -O -target "$TARGET" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" -emit-library \
-    -module-name VorssaintNowPlaying \
-    Sources/NowPlayingAdapter/NowPlayingAdapter.swift \
-    Sources/NowPlayingAdapter/NowPlayingQueue.swift \
-    Sources/NowPlayingAdapter/NowPlayingSelection.swift \
-    Sources/Vorssaint/Services/Notch/NotchPlaybackSource.swift \
-    Sources/Vorssaint/Services/Notch/NotchPlaybackCommand.swift \
-    -o "build/$NOW_PLAYING_ADAPTER"
+ADAPTER_ARCH_BINARIES=()
+for arch in "$ARCHS[@]"; do
+    (( ${#ARCHS} > 1 )) && echo "  → $arch"
+    swiftc -O -target "$arch$TARGET_SUFFIX" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" -emit-library \
+        -module-name VorssaintNowPlaying \
+        Sources/NowPlayingAdapter/NowPlayingAdapter.swift \
+        Sources/NowPlayingAdapter/NowPlayingQueue.swift \
+        Sources/NowPlayingAdapter/NowPlayingSelection.swift \
+        Sources/Vorssaint/Services/Notch/NotchPlaybackSource.swift \
+        Sources/Vorssaint/Services/Notch/NotchPlaybackCommand.swift \
+        -o "build/$NOW_PLAYING_ADAPTER.$arch"
+    ADAPTER_ARCH_BINARIES+=("build/$NOW_PLAYING_ADAPTER.$arch")
+done
+lipo_combine "build/$NOW_PLAYING_ADAPTER" "${ADAPTER_ARCH_BINARIES[@]}"
 
 echo "▸ Generating app icon…"
 swift Tools/MakeIcon.swift build/AppIcon.iconset
